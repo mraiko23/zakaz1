@@ -26,16 +26,20 @@ function loadDB() {
     users: {},
     tasks: [],
     opChannels: [], // Required channels (OP channels)
+    withdrawalRequests: [], // Withdrawal requests
+    promocodes: [], // Promocodes for withdrawal bonuses
     settings: {
       welcomeText: '👋 Добро пожаловать! Выполняйте задания и получайте Робуксы!',
       referralReward: 100,
       unsubscribePenalty: 50,
+      minWithdrawal: 100, // Minimum withdrawal amount
       aboutText: '📢 О боте\n\nЗдесь вы можете заработать Робуксы, выполняя простые задания!',
       channelLink: 'https://t.me/yourchannel',
       withdrawalsLink: 'https://t.me/yourwithdrawals',
       giveawaysLink: 'https://t.me/yourgiveaways',
       supportContact: '@support',
-      techSupport: '@tech_support'
+      techSupport: '@tech_support',
+      adminId: null // Admin chat ID for notifications
     },
     subscriptionChecks: {}
   };
@@ -52,6 +56,20 @@ function saveDB(db) {
 }
 
 let db = loadDB();
+
+// Initialize new fields if they don't exist
+if (!db.withdrawalRequests) {
+  db.withdrawalRequests = [];
+  saveDB(db);
+}
+if (!db.settings.minWithdrawal) {
+  db.settings.minWithdrawal = 100;
+  saveDB(db);
+}
+if (!db.promocodes) {
+  db.promocodes = [];
+  saveDB(db);
+}
 
 // ============ HTTP SERVER FOR DB DOWNLOAD/UPLOAD ============
 const app = express();
@@ -113,7 +131,9 @@ function getUser(userId) {
       joinedChannels: [],
       lastSubscriptionCheck: Date.now(),
       taskWarnings: {}, // { taskId: { channelId: timestamp } }
-      blocked: false // User blocked status
+      blocked: false, // User blocked status
+      withdrawalCooldown: 0, // Timestamp when user can withdraw again
+      usedPromocodes: [] // Array of used promocode codes
     };
     saveDB(db);
   }
@@ -125,11 +145,29 @@ function getUser(userId) {
   if (db.users[userId].blocked === undefined) {
     db.users[userId].blocked = false;
   }
+  // Add withdrawalCooldown if it doesn't exist (for existing users)
+  if (!db.users[userId].withdrawalCooldown) {
+    db.users[userId].withdrawalCooldown = 0;
+  }
+  // Add usedPromocodes if it doesn't exist (for existing users)
+  if (!db.users[userId].usedPromocodes) {
+    db.users[userId].usedPromocodes = [];
+  }
   return db.users[userId];
 }
 
 function isAdmin(username) {
   return username === ADMIN_USERNAME;
+}
+
+// Generate random withdrawal token
+function generateToken() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let token = '';
+  for (let i = 0; i < 8; i++) {
+    token += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return token;
 }
 
 // ============ SUBSCRIPTION CHECK ============
@@ -266,6 +304,7 @@ function adminMenuKeyboard() {
       [{ text: '💸 Убрать робуксы', callback_data: 'admin_remove_robux' }],
       [{ text: '🚫 Заблокировать пользователя', callback_data: 'admin_block_user' }],
       [{ text: '✅ Разблокировать пользователя', callback_data: 'admin_unblock_user' }],
+      [{ text: '🎫 Промокоды', callback_data: 'admin_promocodes' }],
       [{ text: '⭐ ОП каналы', callback_data: 'admin_op_channels' }],
       [{ text: '📋 Каналы в заданиях', callback_data: 'admin_task_channels' }],
       [{ text: '✏️ Изменить приветствие', callback_data: 'admin_edit_welcome' }],
@@ -275,6 +314,8 @@ function adminMenuKeyboard() {
       [{ text: '💳 Ссылка "Выводы"', callback_data: 'admin_edit_withdrawals_link' }],
       [{ text: '🎁 Ссылка "Розыгрыши"', callback_data: 'admin_edit_giveaways_link' }],
       [{ text: '💸 Контакт для вывода', callback_data: 'admin_edit_withdraw_contact' }],
+      [{ text: '💵 Мин. сумма вывода', callback_data: 'admin_edit_min_withdrawal' }],
+      [{ text: '🆔 Изменить Admin ID', callback_data: 'admin_edit_admin_id' }],
       [{ text: '💰 Цена за отписку', callback_data: 'admin_edit_penalty' }],
       [{ text: '🛠 Изменить тех. поддержку', callback_data: 'admin_edit_support' }],
       [{ text: '« Назад', callback_data: 'main_menu' }]
@@ -288,6 +329,13 @@ bot.onText(/\/start(.*)/, async (msg, match) => {
   const userId = msg.from.id;
   const username = msg.from.username;
   const referralCode = match[1].trim();
+  
+  // Save admin ID for notifications
+  if (username && isAdmin(username) && !db.settings.adminId) {
+    db.settings.adminId = userId;
+    saveDB(db);
+    console.log(`[INFO] Admin ID saved: ${userId}`);
+  }
   
   const user = getUser(userId);
   
@@ -344,6 +392,99 @@ bot.onText(/\/admin/, async (msg) => {
   bot.sendMessage(chatId, '🔧 Админ-панель', { reply_markup: adminMenuKeyboard() });
 });
 
+bot.onText(/\/stoptoken (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const username = msg.from.username;
+  const token = match[1].trim().toUpperCase();
+  
+  if (!isAdmin(username)) {
+    return bot.sendMessage(chatId, '⛔ У вас нет прав администратора');
+  }
+  
+  // Find request by token
+  const request = db.withdrawalRequests.find(r => r.token === token);
+  
+  if (!request) {
+    return bot.sendMessage(chatId, `❌ Заявка с токеном ${token} не найдена`);
+  }
+  
+  if (request.status === 'completed') {
+    return bot.sendMessage(chatId, `⚠️ Заявка с токеном ${token} уже завершена`);
+  }
+  
+  if (request.status === 'rejected') {
+    return bot.sendMessage(chatId, `⚠️ Заявка с токеном ${token} была отклонена`);
+  }
+  
+  if (request.status === 'pending') {
+    return bot.sendMessage(chatId, `⚠️ Заявка с токеном ${token} ещё не одобрена`);
+  }
+  
+  // Mark as completed
+  request.status = 'completed';
+  request.completedAt = Date.now();
+  saveDB(db);
+  
+  bot.sendMessage(chatId, `✅ Заявка завершена!\n\n🆔 ID заявки: ${request.id}\n👤 Пользователь: @${request.username} (ID: ${request.userId})\n💸 Сумма: ${request.amount} Робуксов\n🔑 Токен: ${token}\n\n✅ Вывод обработан!`);
+  
+  // Notify user
+  try {
+    await bot.sendMessage(request.userId, `✅ Ваш вывод обработан!\n\n💸 Сумма: ${request.amount} Робуксов\n🔑 Токен: ${token}\n\n🎉 Средства переведены! Спасибо за использование бота!`);
+  } catch (error) {
+    console.error('Error notifying user:', error);
+  }
+});
+
+bot.onText(/\/checktoken (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const token = match[1].trim().toUpperCase();
+  
+  // Find request by token
+  const request = db.withdrawalRequests.find(r => r.token === token);
+  
+  if (!request) {
+    return bot.sendMessage(chatId, `❌ Заявка с токеном ${token} не найдена`);
+  }
+  
+  // Status icons and text
+  const statusEmoji = {
+    'pending': '⏳',
+    'approved': '✅',
+    'rejected': '❌',
+    'completed': '🎉'
+  };
+  
+  const statusText = {
+    'pending': 'Ожидает одобрения',
+    'approved': 'Одобрено, ожидает перевода',
+    'rejected': 'Отклонено',
+    'completed': 'Завершено'
+  };
+  
+  let message = `🔍 Информация о заявке\n\n`;
+  message += `🆔 ID заявки: ${request.id}\n`;
+  message += `👤 Пользователь: @${request.username} (ID: ${request.userId})\n`;
+  message += `💸 Сумма: ${request.amount} Робуксов\n`;
+  message += `🔑 Токен: ${token}\n`;
+  message += `${statusEmoji[request.status]} Статус: ${statusText[request.status]}\n\n`;
+  
+  // Add timestamps
+  const createdDate = new Date(request.timestamp);
+  message += `📅 Создано: ${createdDate.toLocaleString('ru-RU')}\n`;
+  
+  if (request.approvedAt) {
+    const approvedDate = new Date(request.approvedAt);
+    message += `✅ Одобрено: ${approvedDate.toLocaleString('ru-RU')}\n`;
+  }
+  
+  if (request.completedAt) {
+    const completedDate = new Date(request.completedAt);
+    message += `🎉 Завершено: ${completedDate.toLocaleString('ru-RU')}\n`;
+  }
+  
+  bot.sendMessage(chatId, message);
+});
+
 // ============ CALLBACK HANDLERS ============
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
@@ -361,7 +502,7 @@ bot.on('callback_query', async (query) => {
   }
   
   // Check if user needs to subscribe to OP channels (except for check_subscriptions, about_bot, admin actions, and delete actions)
-  if (!data.startsWith('admin_') && !data.startsWith('delete_op_') && !data.startsWith('delete_task_') && data !== 'check_subscriptions' && data !== 'main_menu' && data !== 'about_bot') {
+  if (!data.startsWith('admin_') && !data.startsWith('delete_op_') && !data.startsWith('delete_task_') && !data.startsWith('delete_promo_') && !data.startsWith('activate_promo') && data !== 'check_subscriptions' && data !== 'main_menu' && data !== 'about_bot') {
     if (db.opChannels.length > 0) {
       const subscriptions = await checkAllRequiredChannels(userId);
       const unsubscribed = subscriptions.filter(s => !s.subscribed);
@@ -409,21 +550,80 @@ bot.on('callback_query', async (query) => {
   else if (data === 'profile') {
     const user = getUser(userId);
     const referralLink = `https://t.me/${(await bot.getMe()).username}?start=${userId}`;
-    const message = `👤 Ваш профиль\n\n💰 Баланс: ${user.balance} Робуксов\n👥 Рефералов: ${user.referrals.length}\n🔗 Ваша реферальная ссылка:\n${referralLink}`;
+    
+    let message = `👤 Ваш профиль\n\n`;
+    message += `💰 Баланс: ${user.balance} Робуксов\n`;
+    message += `👥 Рефералов: ${user.referrals.length}\n`;
+    
+    // Show active promocode
+    if (user.activePromocode) {
+      message += `🎫 Активный промокод: ${user.activePromocode.code} (+${user.activePromocode.bonus}%)\n`;
+    }
+    
+    message += `\n🔗 Ваша реферальная ссылка:\n${referralLink}`;
+    
+    const keyboard = [
+      [{ text: '🎫 Активировать промокод', callback_data: 'activate_promo' }],
+      [{ text: '« Назад', callback_data: 'get_robux' }]
+    ];
     
     bot.editMessageText(message, {
       chat_id: chatId,
       message_id: messageId,
-      reply_markup: { inline_keyboard: [[{ text: '« Назад', callback_data: 'get_robux' }]] }
+      reply_markup: { inline_keyboard: keyboard }
     });
   }
   
   else if (data === 'withdraw') {
-    bot.editMessageText('💸 Вывод средств\n\nДля вывода средств свяжитесь с администрацией:\n' + db.settings.supportContact, {
+    const user = getUser(userId);
+    const minAmount = db.settings.minWithdrawal || 100;
+    
+    // Check if user has cooldown
+    if (user.withdrawalCooldown && user.withdrawalCooldown > Date.now()) {
+      const remainingMinutes = Math.ceil((user.withdrawalCooldown - Date.now()) / 60000);
+      bot.answerCallbackQuery(query.id, { 
+        text: `⏰ Вы сможете подать новую заявку через ${remainingMinutes} мин.`, 
+        show_alert: true 
+      });
+      return;
+    }
+    
+    bot.editMessageText(`💸 Вывод средств\n\n💰 Ваш баланс: ${user.balance} Робуксов\n📉 Минимальная сумма: ${minAmount} Робуксов\n\nВведите сумму для вывода:`, {
       chat_id: chatId,
       message_id: messageId,
-      reply_markup: { inline_keyboard: [[{ text: '« Назад', callback_data: 'get_robux' }]] }
+      reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'withdraw_cancel' }]] }
     });
+    
+    db.adminStates = db.adminStates || {};
+    db.adminStates[userId] = { action: 'withdraw_amount' };
+    saveDB(db);
+  }
+  
+  else if (data === 'withdraw_cancel') {
+    if (db.adminStates && db.adminStates[userId]) {
+      delete db.adminStates[userId];
+      saveDB(db);
+    }
+    bot.editMessageText('❌ Вывод отменен', {
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: getRobuxKeyboard()
+    });
+  }
+  
+  else if (data === 'activate_promo') {
+    bot.sendMessage(chatId, '🎫 Введите промокод:', { reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'promo_cancel' }]] }});
+    db.adminStates = db.adminStates || {};
+    db.adminStates[userId] = { action: 'enter_promo' };
+    saveDB(db);
+  }
+  
+  else if (data === 'promo_cancel') {
+    if (db.adminStates && db.adminStates[userId]) {
+      delete db.adminStates[userId];
+      saveDB(db);
+    }
+    bot.sendMessage(chatId, '❌ Действие отменено');
   }
   
   else if (data === 'about_bot') {
@@ -632,6 +832,49 @@ bot.on('callback_query', async (query) => {
     }
   }
   
+  // Delete promo handler (must be before admin_ block)
+  else if (data.startsWith('delete_promo_')) {
+    if (!isAdmin(username)) {
+      return bot.answerCallbackQuery(query.id, { text: '⛔ Нет прав доступа', show_alert: true });
+    }
+    
+    const promoCode = data.replace('delete_promo_', '');
+    const promo = db.promocodes.find(p => p.code === promoCode);
+    
+    if (promo) {
+      db.promocodes = db.promocodes.filter(p => p.code !== promoCode);
+      saveDB(db);
+      bot.answerCallbackQuery(query.id, { text: `✅ Промокод "${promoCode}" удален`, show_alert: true });
+      
+      // Refresh the list
+      let message = '🎫 Управление промокодами\n\n';
+      const keyboard = [];
+      
+      if (db.promocodes.length === 0) {
+        message += 'Нет активных промокодов\n\n';
+        message += '📝 Для добавления промокода используйте:\n/add_promo КОД процент кол-во\n\n💡 Пример:\n/add_promo BONUS20 20 100\n(код BONUS20, +20% к выводу, 100 использований)';
+      } else {
+        message += `Всего промокодов: ${db.promocodes.length}\n\n`;
+        db.promocodes.forEach((promo, i) => {
+          const usedCount = Object.values(db.users).filter(u => u.usedPromocodes && u.usedPromocodes.includes(promo.code)).length;
+          message += `${i + 1}. 🎫 ${promo.code}\n`;
+          message += `   📈 Бонус: +${promo.bonus}%\n`;
+          message += `   👥 Использовано: ${usedCount}/${promo.maxUses}\n\n`;
+          keyboard.push([{ text: `🗑 Удалить "${promo.code}"`, callback_data: `delete_promo_${promo.code}` }]);
+        });
+        message += '\n📝 Добавить: /add_promo КОД процент кол-во';
+      }
+      
+      keyboard.push([{ text: '« Назад', callback_data: 'admin_menu' }]);
+      
+      bot.editMessageText(message, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    }
+  }
+  
   // Delete task handler (must be before admin_ block)
   else if (data.startsWith('delete_task_')) {
     if (!isAdmin(username)) {
@@ -769,6 +1012,34 @@ bot.on('callback_query', async (query) => {
       });
     }
     
+    else if (data === 'admin_promocodes') {
+      let message = '🎫 Управление промокодами\n\n';
+      const keyboard = [];
+      
+      if (db.promocodes.length === 0) {
+        message += 'Нет активных промокодов\n\n';
+        message += '📝 Для добавления промокода используйте:\n/add_promo КОД процент кол-во\n\n💡 Пример:\n/add_promo BONUS20 20 100\n(код BONUS20, +20% к выводу, 100 использований)';
+      } else {
+        message += `Всего промокодов: ${db.promocodes.length}\n\n`;
+        db.promocodes.forEach((promo, i) => {
+          const usedCount = Object.values(db.users).filter(u => u.usedPromocodes && u.usedPromocodes.includes(promo.code)).length;
+          message += `${i + 1}. 🎫 ${promo.code}\n`;
+          message += `   📈 Бонус: +${promo.bonus}%\n`;
+          message += `   👥 Использовано: ${usedCount}/${promo.maxUses}\n\n`;
+          keyboard.push([{ text: `🗑 Удалить "${promo.code}"`, callback_data: `delete_promo_${promo.code}` }]);
+        });
+        message += '\n📝 Добавить: /add_promo КОД процент кол-во';
+      }
+      
+      keyboard.push([{ text: '« Назад', callback_data: 'admin_menu' }]);
+      
+      bot.editMessageText(message, {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: keyboard }
+      });
+    }
+    
     else if (data === 'admin_edit_welcome') {
       bot.sendMessage(chatId, '✏️ Введите новый текст приветствия:', { reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel' }]] }});
       db.adminStates = db.adminStates || {};
@@ -832,6 +1103,20 @@ bot.on('callback_query', async (query) => {
       saveDB(db);
     }
     
+    else if (data === 'admin_edit_min_withdrawal') {
+      bot.sendMessage(chatId, `💵 Текущая минимальная сумма вывода: ${db.settings.minWithdrawal} Робуксов\n\nВведите новую минимальную сумму:`, { reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel' }]] }});
+      db.adminStates = db.adminStates || {};
+      db.adminStates[userId] = { action: 'edit_min_withdrawal' };
+      saveDB(db);
+    }
+    
+    else if (data === 'admin_edit_admin_id') {
+      bot.sendMessage(chatId, `🆔 Текущий Admin ID: ${db.settings.adminId || 'не установлен'}\n\nВведите новый Admin ID:`, { reply_markup: { inline_keyboard: [[{ text: '❌ Отмена', callback_data: 'admin_cancel' }]] }});
+      db.adminStates = db.adminStates || {};
+      db.adminStates[userId] = { action: 'edit_admin_id' };
+      saveDB(db);
+    }
+    
     else if (data === 'admin_cancel') {
       if (db.adminStates && db.adminStates[userId]) {
         delete db.adminStates[userId];
@@ -846,6 +1131,89 @@ bot.on('callback_query', async (query) => {
         message_id: messageId,
         reply_markup: adminMenuKeyboard()
       });
+    }
+  }
+  
+  // Handle withdrawal request approval (OUTSIDE admin_ block)
+  else if (data.startsWith('approve_withdrawal_')) {
+    if (!isAdmin(username)) {
+      bot.answerCallbackQuery(query.id, { text: '⛔ У вас нет прав администратора', show_alert: true });
+      return;
+    }
+    
+    const requestId = parseInt(data.replace('approve_withdrawal_', ''));
+    const request = db.withdrawalRequests.find(r => r.id === requestId);
+    
+    if (!request) {
+      bot.answerCallbackQuery(query.id, { text: '❌ Заявка не найдена', show_alert: true });
+      return;
+    }
+    
+    if (request.status !== 'pending') {
+      bot.answerCallbackQuery(query.id, { text: '⚠️ Заявка уже обработана', show_alert: true });
+      return;
+    }
+    
+    // Generate token and mark as approved (not completed)
+    const token = generateToken();
+    request.status = 'approved';
+    request.token = token;
+    request.approvedAt = Date.now();
+    saveDB(db);
+    
+    // Update admin message with token
+    bot.editMessageText(`✅ Заявка принята!\n\n🆔 ID заявки: ${requestId}\n👤 Пользователь: @${request.username} (ID: ${request.userId})\n💸 Сумма: ${request.amount} Робуксов\n🔑 Токен: ${token}\n\n✅ Статус: Одобрено\n\n💡 Для закрытия заявки используйте:\n/stoptoken ${token}`, {
+      chat_id: chatId,
+      message_id: messageId
+    });
+    
+    // Send user contact info and token
+    try {
+      const supportContact = db.settings.supportContact || '@support';
+      await bot.sendMessage(request.userId, `✅ Ваша заявка на вывод одобрена!\n\n💸 Сумма: ${request.amount} Робуксов\n🔑 Ваш токен: ${token}\n\n📞 Для получения средств напишите:\n${supportContact}\n\n⚠️ Сообщите этот токен администратору для подтверждения!\n\n💡 Токен действителен до завершения выплаты.`);
+    } catch (error) {
+      console.error('Error notifying user:', error);
+    }
+  }
+  
+  // Handle withdrawal request rejection
+  else if (data.startsWith('reject_withdrawal_')) {
+    if (!isAdmin(username)) {
+      bot.answerCallbackQuery(query.id, { text: '⛔ У вас нет прав администратора', show_alert: true });
+      return;
+    }
+    
+    const requestId = parseInt(data.replace('reject_withdrawal_', ''));
+    const request = db.withdrawalRequests.find(r => r.id === requestId);
+    
+    if (!request) {
+      bot.answerCallbackQuery(query.id, { text: '❌ Заявка не найдена', show_alert: true });
+      return;
+    }
+    
+    if (request.status !== 'pending') {
+      bot.answerCallbackQuery(query.id, { text: '⚠️ Заявка уже обработана', show_alert: true });
+      return;
+    }
+    
+    // Mark as rejected and return money with cooldown
+    request.status = 'rejected';
+    const user = getUser(request.userId);
+    user.balance += request.amount;
+    user.withdrawalCooldown = Date.now() + (60 * 60 * 1000); // 1 hour cooldown
+    saveDB(db);
+    
+    // Update admin message
+    bot.editMessageText(`❌ Заявка отклонена!\n\n🆔 ID заявки: ${requestId}\n👤 Пользователь: @${request.username} (ID: ${request.userId})\n💸 Сумма: ${request.amount} Робуксов\n\n❌ Статус: Отклонено`, {
+      chat_id: chatId,
+      message_id: messageId
+    });
+    
+    // Notify user
+    try {
+      await bot.sendMessage(request.userId, `❌ Ваша заявка на вывод отклонена\n\n💸 Сумма ${request.amount} Робуксов возвращена на ваш баланс\n💰 Ваш баланс: ${user.balance} Робуксов\n\n⏰ Вы сможете подать новую заявку через 1 час`);
+    } catch (error) {
+      console.error('Error notifying user:', error);
     }
   }
 });
@@ -865,14 +1233,19 @@ bot.on('message', async (msg) => {
     return;
   }
   
-  if (!isAdmin(username)) {
+  // Check if action is for regular users (withdrawal related or promo related)
+  const userActions = ['withdraw_amount', 'enter_promo'];
+  const isUserAction = userActions.includes(adminState.action);
+  
+  // For admin actions, check admin privileges
+  if (!isUserAction && !isAdmin(username)) {
     delete db.adminStates[userId];
     saveDB(db);
     return;
   }
   
   // Handle admin states
-  if (adminState.action === 'broadcast') {
+  if (adminState.action === 'broadcast' && isAdmin(username)) {
     let broadcastText = msg.text || msg.caption || '';
     let photo = msg.photo ? msg.photo[msg.photo.length - 1].file_id : null;
     let buttons = null;
@@ -923,7 +1296,7 @@ bot.on('message', async (msg) => {
     saveDB(db);
   }
   
-  else if (adminState.action === 'user_info') {
+  else if (adminState.action === 'user_info' && isAdmin(username)) {
     const targetUserId = parseInt(msg.text);
     const user = db.users[targetUserId];
     
@@ -940,7 +1313,7 @@ bot.on('message', async (msg) => {
     saveDB(db);
   }
   
-  else if (adminState.action === 'add_robux') {
+  else if (adminState.action === 'add_robux' && isAdmin(username)) {
     const parts = msg.text.trim().split(/\s+/);
     if (parts.length !== 2) {
       bot.sendMessage(chatId, '❌ Неверный формат!\nИспользуйте: ID сумма');
@@ -972,7 +1345,7 @@ bot.on('message', async (msg) => {
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'remove_robux') {
+  else if (adminState.action === 'remove_robux' && isAdmin(username)) {
     const parts = msg.text.trim().split(/\s+/);
     if (parts.length !== 2) {
       bot.sendMessage(chatId, '❌ Неверный формат!\nИспользуйте: ID сумма');
@@ -1004,7 +1377,7 @@ bot.on('message', async (msg) => {
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'block_user') {
+  else if (adminState.action === 'block_user' && isAdmin(username)) {
     const targetUserId = parseInt(msg.text);
     
     if (isNaN(targetUserId)) {
@@ -1031,7 +1404,7 @@ bot.on('message', async (msg) => {
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'unblock_user') {
+  else if (adminState.action === 'unblock_user' && isAdmin(username)) {
     const targetUserId = parseInt(msg.text);
     
     if (isNaN(targetUserId)) {
@@ -1058,14 +1431,14 @@ bot.on('message', async (msg) => {
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_welcome') {
+  else if (adminState.action === 'edit_welcome' && isAdmin(username)) {
     db.settings.welcomeText = msg.text;
     saveDB(db);
     bot.sendMessage(chatId, '✅ Текст приветствия обновлен');
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_referral') {
+  else if (adminState.action === 'edit_referral' && isAdmin(username)) {
     const reward = parseFloat(msg.text);
     if (isNaN(reward) || reward < 0) {
       bot.sendMessage(chatId, '❌ Введите корректное число');
@@ -1077,14 +1450,14 @@ bot.on('message', async (msg) => {
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_about') {
+  else if (adminState.action === 'edit_about' && isAdmin(username)) {
     db.settings.aboutText = msg.text;
     saveDB(db);
     bot.sendMessage(chatId, '✅ Текст "О боте" обновлен');
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_penalty') {
+  else if (adminState.action === 'edit_penalty' && isAdmin(username)) {
     const penalty = parseFloat(msg.text);
     if (isNaN(penalty) || penalty < 0) {
       bot.sendMessage(chatId, '❌ Введите корректное число');
@@ -1096,39 +1469,201 @@ bot.on('message', async (msg) => {
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_support') {
+  else if (adminState.action === 'edit_support' && isAdmin(username)) {
     db.settings.techSupport = msg.text;
     saveDB(db);
     bot.sendMessage(chatId, `✅ Тех. поддержка обновлена: ${msg.text}`);
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_channel_link') {
+  else if (adminState.action === 'edit_channel_link' && isAdmin(username)) {
     db.settings.channelLink = msg.text.trim();
     saveDB(db);
     bot.sendMessage(chatId, `✅ Ссылка "Наш канал" обновлена: ${msg.text}`);
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_withdrawals_link') {
+  else if (adminState.action === 'edit_withdrawals_link' && isAdmin(username)) {
     db.settings.withdrawalsLink = msg.text.trim();
     saveDB(db);
     bot.sendMessage(chatId, `✅ Ссылка "Выводы" обновлена: ${msg.text}`);
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_giveaways_link') {
+  else if (adminState.action === 'edit_giveaways_link' && isAdmin(username)) {
     db.settings.giveawaysLink = msg.text.trim();
     saveDB(db);
     bot.sendMessage(chatId, `✅ Ссылка "Розыгрыши" обновлена: ${msg.text}`);
     delete db.adminStates[userId];
   }
   
-  else if (adminState.action === 'edit_withdraw_contact') {
+  else if (adminState.action === 'edit_withdraw_contact' && isAdmin(username)) {
     db.settings.supportContact = msg.text;
     saveDB(db);
     bot.sendMessage(chatId, `✅ Контакт для вывода обновлен: ${msg.text}`);
     delete db.adminStates[userId];
+  }
+  
+  else if (adminState.action === 'edit_min_withdrawal' && isAdmin(username)) {
+    const minAmount = parseInt(msg.text);
+    if (isNaN(minAmount) || minAmount < 0 || !Number.isInteger(parseFloat(msg.text))) {
+      bot.sendMessage(chatId, '❌ Введите корректное целое число');
+    } else {
+      db.settings.minWithdrawal = minAmount;
+      saveDB(db);
+      bot.sendMessage(chatId, `✅ Минимальная сумма вывода установлена: ${minAmount} Робуксов`);
+    }
+    delete db.adminStates[userId];
+  }
+  
+  else if (adminState.action === 'edit_admin_id' && isAdmin(username)) {
+    const newAdminId = parseInt(msg.text);
+    if (isNaN(newAdminId)) {
+      bot.sendMessage(chatId, '❌ Введите корректный ID!');
+    } else {
+      db.settings.adminId = newAdminId;
+      saveDB(db);
+      bot.sendMessage(chatId, `✅ Admin ID установлен: ${newAdminId}`);
+    }
+    delete db.adminStates[userId];
+  }
+  
+  
+  // Handle withdrawal amount input from users
+  else if (adminState.action === 'enter_promo') {
+    const promoCode = msg.text.trim().toUpperCase();
+    const user = getUser(userId);
+    
+    // Find promo
+    const promo = db.promocodes.find(p => p.code === promoCode);
+    
+    if (!promo) {
+      bot.sendMessage(chatId, '❌ Промокод не найден');
+      delete db.adminStates[userId];
+      return;
+    }
+    
+    // Check if already used by this user
+    if (user.usedPromocodes.includes(promoCode)) {
+      bot.sendMessage(chatId, '❌ Вы уже использовали этот промокод');
+      delete db.adminStates[userId];
+      return;
+    }
+    
+    // Check if max uses reached
+    const usedCount = Object.values(db.users).filter(u => u.usedPromocodes && u.usedPromocodes.includes(promoCode)).length;
+    if (usedCount >= promo.maxUses) {
+      bot.sendMessage(chatId, '❌ Промокод исчерпан');
+      delete db.adminStates[userId];
+      return;
+    }
+    
+    // Activate promocode
+    user.activePromocode = {
+      code: promoCode,
+      bonus: promo.bonus,
+      activatedAt: Date.now()
+    };
+    user.usedPromocodes.push(promoCode);
+    saveDB(db);
+    
+    bot.sendMessage(chatId, `✅ Промокод активирован!\n\n🎫 Код: ${promoCode}\n📈 Бонус: +${promo.bonus}%\n\n💡 При следующем выводе вы получите +${promo.bonus}% к сумме вывода!`);
+    delete db.adminStates[userId];
+  }
+  
+  else if (adminState.action === 'withdraw_amount') {
+    console.log(`[DEBUG] Withdrawal amount handler triggered for user ${userId}, username: ${username}`);
+    console.log(`[DEBUG] Message text: ${msg.text}`);
+    console.log(`[DEBUG] Admin state:`, adminState);
+    const amount = parseInt(msg.text);
+    const user = getUser(userId);
+    const minAmount = db.settings.minWithdrawal || 100;
+    
+    if (isNaN(amount) || amount <= 0 || !Number.isInteger(parseFloat(msg.text))) {
+      bot.sendMessage(chatId, '❌ Введите корректное целое число!');
+      delete db.adminStates[userId];
+      return;
+    }
+    
+    if (amount < minAmount) {
+      bot.sendMessage(chatId, `❌ Минимальная сумма для вывода: ${minAmount} Робуксов`);
+      delete db.adminStates[userId];
+      return;
+    }
+    
+    if (amount > user.balance) {
+      bot.sendMessage(chatId, `❌ Недостаточно средств!\n💰 Ваш баланс: ${user.balance} Робуксов`);
+      delete db.adminStates[userId];
+      return;
+    }
+    
+    // Apply promocode bonus if active
+    let finalAmount = amount;
+    let promoInfo = null;
+    if (user.activePromocode) {
+      const bonusAmount = Math.floor(amount * user.activePromocode.bonus / 100);
+      finalAmount = amount + bonusAmount;
+      promoInfo = {
+        code: user.activePromocode.code,
+        bonus: user.activePromocode.bonus,
+        bonusAmount: bonusAmount
+      };
+      // Remove active promocode after use
+      delete user.activePromocode;
+    }
+    
+    // Create withdrawal request
+    const requestId = Date.now();
+    const request = {
+      id: requestId,
+      userId: userId,
+      username: username || 'No username',
+      amount: finalAmount,
+      originalAmount: amount,
+      promocode: promoInfo,
+      status: 'pending',
+      timestamp: Date.now()
+    };
+    
+    db.withdrawalRequests.push(request);
+    user.balance -= amount;
+    saveDB(db);
+    
+    let confirmMessage = `✅ Заявка на вывод создана!\n\n💸 Сумма: ${amount} Робуксов`;
+    if (promoInfo) {
+      confirmMessage += `\n🎫 Промокод: ${promoInfo.code} (+${promoInfo.bonus}%)\n📈 Бонус: +${promoInfo.bonusAmount} Робуксов\n💰 Итого к выводу: ${finalAmount} Робуксов`;
+    }
+    confirmMessage += `\n\n🕢 Заявка отправлена администратору.\n⏳ Ожидайте обработки...`;
+    
+    bot.sendMessage(chatId, confirmMessage);
+    
+    delete db.adminStates[userId];
+    
+    // Notify admin
+    if (db.settings.adminId) {
+      try {
+        let adminMessage = `📥 Новая заявка на вывод!\n\n🆔 ID заявки: ${requestId}\n👤 Пользователь: @${username || 'No username'} (ID: ${userId})\n💸 Сумма: ${finalAmount} Робуксов`;
+        if (promoInfo) {
+          adminMessage += `\n🎫 Промокод: ${promoInfo.code} (+${promoInfo.bonus}%, +${promoInfo.bonusAmount} Robux)`;
+        }
+        
+        await bot.sendMessage(db.settings.adminId, adminMessage, {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '✅ Принять', callback_data: `approve_withdrawal_${requestId}` },
+                { text: '❌ Отклонить', callback_data: `reject_withdrawal_${requestId}` }
+              ]
+            ]
+          }
+        });
+        console.log(`[INFO] Withdrawal notification sent to admin ${db.settings.adminId}`);
+      } catch (error) {
+        console.error('[ERROR] Failed to notify admin:', error);
+      }
+    } else {
+      console.error('[ERROR] Admin ID not set! Admin needs to start the bot first.');
+    }
   }
 });
 
@@ -1291,6 +1826,40 @@ bot.onText(/\/add_task/, async (msg) => {
   db.adminStates = db.adminStates || {};
   db.adminStates[msg.from.id] = { action: 'create_task' };
   saveDB(db);
+});
+
+bot.onText(/\/add_promo ([A-Za-z0-9_]+) (\d+) (\d+)/, async (msg, match) => {
+  const username = msg.from.username;
+  if (!isAdmin(username)) {
+    return bot.sendMessage(msg.chat.id, '⛔ У вас нет прав администратора');
+  }
+  
+  const code = match[1].toUpperCase();
+  const bonus = parseInt(match[2]);
+  const maxUses = parseInt(match[3]);
+  
+  // Check if promo already exists
+  if (db.promocodes.find(p => p.code === code)) {
+    return bot.sendMessage(msg.chat.id, `❌ Промокод "${code}" уже существует`);
+  }
+  
+  if (bonus <= 0 || bonus > 100) {
+    return bot.sendMessage(msg.chat.id, '❌ Бонус должен быть от 1 до 100%');
+  }
+  
+  if (maxUses <= 0) {
+    return bot.sendMessage(msg.chat.id, '❌ Количество использований должно быть больше 0');
+  }
+  
+  db.promocodes.push({
+    code: code,
+    bonus: bonus,
+    maxUses: maxUses,
+    createdAt: Date.now()
+  });
+  saveDB(db);
+  
+  bot.sendMessage(msg.chat.id, `✅ Промокод создан!\n\n🎫 Код: ${code}\n📈 Бонус: +${bonus}%\n👥 Макс использований: ${maxUses}\n\n💡 Пользователи могут активировать его в профиле`);
 });
 
 bot.on('message', async (msg) => {
