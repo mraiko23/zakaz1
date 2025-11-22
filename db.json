@@ -1,0 +1,64 @@
+{
+  "users": {
+    "7643517190": {
+      "id": 7643517190,
+      "balance": 50.05,
+      "referrals": [],
+      "completedTasks": [
+        1
+      ],
+      "joinedChannels": [
+        -1003414206228
+      ],
+      "lastSubscriptionCheck": 1763790503458,
+      "taskWarnings": {},
+      "blocked": false
+    },
+    "8455455537": {
+      "id": 8455455537,
+      "balance": 50.05,
+      "referrals": [],
+      "completedTasks": [
+        1,
+        3,
+        2
+      ],
+      "joinedChannels": [
+        -1003414206228,
+        -1002899647253
+      ],
+      "lastSubscriptionCheck": 1763790503458,
+      "taskWarnings": {},
+      "blocked": false
+    },
+    "5199439028": {
+      "id": 5199439028,
+      "balance": 0,
+      "referrals": [],
+      "completedTasks": [],
+      "joinedChannels": [],
+      "lastSubscriptionCheck": 1763791178061,
+      "taskWarnings": {},
+      "blocked": false
+    }
+  },
+  "tasks": [],
+  "opChannels": [],
+  "settings": {
+    "welcomeText": "👋 Добро пожаловать! Выполняйте задания и получайте Робуксы!",
+    "referralReward": 100,
+    "unsubscribePenalty": 50,
+    "aboutText": "📢 О боте\n\nЗдесь вы можете заработать Робуксы, выполняя простые задания!",
+    "channelLink": "@channel2",
+    "withdrawalsLink": "@channel2",
+    "giveawaysLink": "@channel2",
+    "supportContact": "@Ymler_clarity",
+    "techSupport": "@Ymler_clarity"
+  },
+  "subscriptionChecks": {},
+  "adminStates": {
+    "7643517190": {
+      "action": "create_task"
+    }
+  }
+}
